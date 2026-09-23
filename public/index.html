@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SRN Cloud Tracker</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; background: #f4f6f8; }
+        .container { max-width: 1000px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h2 { margin-top: 0; }
+        .input-group { display: flex; gap: 10px; margin-bottom: 20px; }
+        input[type="text"] { flex: 1; padding: 10px; font-size: 15px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 10px 20px; background: #1677ff; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #0958d9; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        th { background: #111827; color: white; }
+        .approved { background: #b7f7c5; }
+        .rejected { background: #ffb3b3; }
+        .pending { background: #eeeeee; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Live SRN Cloud Tracker</h2>
+        <div class="input-group">
+            <input type="text" id="srnInput" placeholder="Enter SRN / EID number...">
+            <button onclick="addSRN()">Add to Background Queue</button>
+        </div>
+        
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>SRN Number</th>
+                    <th>Status</th>
+                    <th>Exact Time Entered</th>
+                    <th>Exact Time Approved</th>
+                    <th>Duration (Middle Time)</th>
+                </tr>
+            </thead>
+            <tbody id="tableBody"></tbody>
+        </table>
+    </div>
+
+    <script>
+        async function loadData() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                const tbody = document.getElementById('tableBody');
+                tbody.innerHTML = '';
+                
+                data.forEach((row, index) => {
+                    const tr = document.createElement('tr');
+                    if(row.status === 'Approved') tr.className = 'approved';
+                    else if(row.status === 'Rejected') tr.className = 'rejected';
+                    else tr.className = 'pending';
+                    
+                    const entered = new Date(row.timeEntered).toLocaleString();
+                    const approved = row.timeApproved ? new Date(row.timeApproved).toLocaleString() : 'Waiting...';
+                    
+                    let duration = 'Calculating...';
+                    if (row.durationSeconds) {
+                        const hrs = Math.floor(row.durationSeconds / 3600);
+                        const mins = Math.floor((row.durationSeconds % 3600) / 60);
+                        const secs = row.durationSeconds % 60;
+                        duration = `${hrs}h ${mins}m ${secs}s`;
+                    }
+
+                    tr.innerHTML = `
+                        <td>${index + 1}</td>
+                        <td><b>${row.srn}</b></td>
+                        <td>${row.status}</td>
+                        <td>${entered}</td>
+                        <td>${approved}</td>
+                        <td><b>${duration}</b></td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } catch (err) {
+                console.error("Failed to load queue status:", err);
+            }
+        }
+
+        async function addSRN() {
+            const input = document.getElementById('srnInput');
+            const srn = input.value.trim();
+            if(!srn) return;
+            
+            await fetch('/api/add', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ srn })
+            });
+            input.value = '';
+            loadData();
+        }
+
+        setInterval(loadData, 5000);
+        loadData();
+    </script>
+</body>
+</html>
