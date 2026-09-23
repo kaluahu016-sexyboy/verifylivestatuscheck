@@ -7,26 +7,25 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 const MONGO_URI = process.env.MONGO_URI; 
 
-// 1. Connect to MongoDB Atlas
 mongoose.connect(MONGO_URI)
   .then(() => console.log("Connected to Cloud Database"))
   .catch(err => console.error("Database connection error:", err));
 
-// 2. Database Schema (Tracks Exact Times)
+// Updated Schema with Live Logging
 const srnSchema = new mongoose.Schema({
     srn: { type: String, unique: true },
     status: { type: String, default: 'Pending' },
     timeEntered: { type: Date, default: Date.now },
     timeApproved: { type: Date, default: null },
-    durationSeconds: { type: Number, default: null }
+    durationSeconds: { type: Number, default: null },
+    lastMessage: { type: String, default: 'Added to queue...' },
+    lastCheckedAt: { type: Date, default: Date.now }
 });
 const SrnModel = mongoose.model('SRN', srnSchema);
 
-// Middleware
 app.use(express.json());
 app.use(express.static('public'));
 
-// 3. API Routes for Frontend Dashboard
 app.post('/api/add', async (req, res) => {
     try {
         const newSrn = new SrnModel({ srn: req.body.srn });
@@ -46,38 +45,9 @@ app.get('/api/status', async (req, res) => {
     }
 });
 
-// Serve Web Dashboard
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// UptimeRobot Keep-Alive Route
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.get('/api/ping', (req, res) => res.send("Alive"));
 
-// 4. Diagnostic Route (To test if UIDAI blocked Render)
-app.get('/api/test-connection', (req, res) => {
-    const testUrl = "wss://aadhaarmitra.uidai.gov.in/ws/v/216c7370-d2ed-43ef-8c94-526a57b21f6d32289672";
-    const ws = new WebSocket(testUrl);
-    
-    // Set a 5-second timeout in case UIDAI drops the connection silently
-    const timeout = setTimeout(() => {
-        ws.terminate();
-        res.send("FAILED: Connection timed out. UIDAI is likely blocking Render's IP.");
-    }, 5000);
-
-    ws.on('open', () => {
-        clearTimeout(timeout);
-        ws.close();
-        res.send("SUCCESS: Render successfully connected to UIDAI.");
-    });
-
-    ws.on('error', (err) => {
-        clearTimeout(timeout);
-        res.send(`FAILED: Connection blocked or failed. Error: ${err.message}`);
-    });
-});
-
-// 5. Background Worker (Runs Continuously)
 const WS_URLS = [
     "wss://aadhaarmitra.uidai.gov.in/ws/v/216c7370-d2ed-43ef-8c94-526a57b21f6d32289672",
     "wss://aadhaarmitra.uidai.gov.in/ws/v/11439326-0558-4f00-b710-f544346b351732289782",
@@ -93,17 +63,28 @@ const WS_URLS = [
 function checkSRN(srn, wsUrl) {
     return new Promise((resolve, reject) => {
         const ws = new WebSocket(wsUrl);
+        let isDone = false;
+
+        // Failsafe: Prevent infinite hanging if UIDAI drops the connection silently
+        const timeout = setTimeout(() => {
+            if (isDone) return;
+            isDone = true;
+            ws.terminate();
+            reject(new Error("Timeout: UIDAI did not respond within 10 seconds"));
+        }, 10000);
+
         const payload = {
             formType: "SINGLE_FORM",
             form_data: { eid: srn, handler: "check_update_status" },
-            type: "FORM", 
-            sendType: "visitor.form.submit", 
-            language: "eng"
+            type: "FORM", sendType: "visitor.form.submit", language: "eng"
         };
         
         ws.on('open', () => ws.send(JSON.stringify(payload)));
         
         ws.on('message', (data) => {
+            if (isDone) return;
+            isDone = true;
+            clearTimeout(timeout);
             let response = data.toString();
             try { 
                 const parsed = JSON.parse(response);
@@ -114,6 +95,9 @@ function checkSRN(srn, wsUrl) {
         });
         
         ws.on('error', (err) => { 
+            if (isDone) return;
+            isDone = true;
+            clearTimeout(timeout);
             ws.close(); 
             reject(err); 
         });
@@ -121,45 +105,57 @@ function checkSRN(srn, wsUrl) {
 }
 
 async function processQueue() {
+    let activeTask = null;
     try {
-        // Find the oldest pending SRN
-        const task = await SrnModel.findOne({ status: 'Pending' }).sort({ timeEntered: 1 });
-        
-        // If queue is empty, wait 5 seconds and check again
-        if (!task) {
-            return setTimeout(processQueue, 5000);
-        }
+        // Find oldest Pending SRN, OR a Checking SRN that got stuck for over 60 seconds
+        const cutoff = new Date(Date.now() - 60000);
+        activeTask = await SrnModel.findOne({
+            $or: [
+                { status: 'Pending' },
+                { status: 'Checking', lastCheckedAt: { $lt: cutoff } }
+            ]
+        }).sort({ lastCheckedAt: 1 });
 
-        // Pick a random WebSocket URL and check the SRN
+        if (!activeTask) return setTimeout(processQueue, 5000);
+
+        // Update UI to show we are actively trying
+        activeTask.status = 'Checking';
+        activeTask.lastCheckedAt = new Date();
+        activeTask.lastMessage = 'Connecting to UIDAI WebSocket...';
+        await activeTask.save();
+
         const wsUrl = WS_URLS[Math.floor(Math.random() * WS_URLS.length)];
-        const result = await checkSRN(task.srn, wsUrl);
+        const result = await checkSRN(activeTask.srn, wsUrl);
         
-        // Process the result
         if (result.includes("Your Aadhaar has been updated")) {
-            task.status = 'Approved';
-            task.timeApproved = new Date();
-            task.durationSeconds = Math.round((task.timeApproved - task.timeEntered) / 1000);
-            await task.save();
-            console.log(`SRN ${task.srn} Approved!`);
+            activeTask.status = 'Approved';
+            activeTask.timeApproved = new Date();
+            activeTask.durationSeconds = Math.round((activeTask.timeApproved - activeTask.timeEntered) / 1000);
+            activeTask.lastMessage = "SUCCESS: " + result;
         } else if (result.toLowerCase().includes("reject")) {
-            task.status = 'Rejected';
-            task.timeApproved = new Date();
-            task.durationSeconds = Math.round((task.timeApproved - task.timeEntered) / 1000);
-            await task.save();
-            console.log(`SRN ${task.srn} Rejected!`);
+            activeTask.status = 'Rejected';
+            activeTask.timeApproved = new Date();
+            activeTask.durationSeconds = Math.round((activeTask.timeApproved - activeTask.timeEntered) / 1000);
+            activeTask.lastMessage = "REJECTED: " + result;
         } else {
-            console.log(`SRN ${task.srn} still pending. Result: ${result}`);
+            activeTask.status = 'Pending';
+            activeTask.lastMessage = "PENDING (UIDAI says): " + result;
         }
+        await activeTask.save();
+
     } catch (error) {
         console.error("Worker Error:", error.message);
+        if (activeTask) {
+            activeTask.status = 'Pending';
+            activeTask.lastMessage = `ERROR: ${error.message} - Retrying soon...`;
+            await activeTask.save();
+        }
     }
     
-    // Safety Delay: Always wait 10 seconds before making the next API call
     setTimeout(processQueue, 10000); 
 }
 
-// 6. Start the Server
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-    processQueue(); // Kick off the background loop
+    processQueue();
 });
